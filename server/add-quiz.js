@@ -6,13 +6,22 @@
 //   node add-quiz.js
 //
 // Sans danger à relancer plusieurs fois : n'insère que les mois absents.
+// Chaque compte a sa propre base isolée — on boucle sur tous les comptes.
 
-const db = require("./db");
+const { getDb } = require("./db");
+const accountsDb = require("./accounts-db");
 const seedQuizzes = require("./seed-quiz");
 
-const result = seedQuizzes(db);
-if (result.inserted === 0) {
-  console.log("Aucun nouveau quiz à ajouter — la base est déjà à jour.");
+const accounts = accountsDb.prepare("SELECT id, email FROM accounts").all();
+if (!accounts.length) {
+  console.log("Aucun compte enregistré — rien à faire.");
 } else {
-  console.log(`${result.inserted} quiz ajouté(s) : ${result.months.join(", ")}`);
+  accounts.forEach(({ id, email }) => {
+    const result = seedQuizzes(getDb(id));
+    if (result.inserted === 0) {
+      console.log(`${email} : aucun nouveau quiz à ajouter — déjà à jour.`);
+    } else {
+      console.log(`${email} : ${result.inserted} quiz ajouté(s) (${result.months.join(", ")})`);
+    }
+  });
 }

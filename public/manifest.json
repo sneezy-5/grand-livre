@@ -1,0 +1,14 @@
+{
+  "name": "Grand livre",
+  "short_name": "Grand livre",
+  "description": "Suivi personnel du parcours Finance x Tech.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1F6F5C",
+  "theme_color": "#1F6F5C",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

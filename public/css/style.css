@@ -109,6 +109,21 @@ body{
 }
 .side-link.active .tab-icon{color:var(--brand);}
 
+.sidebar-bottom{
+  display:flex; flex-direction:column; gap:6px;
+  padding-top:14px; margin-top:14px; border-top:1px solid var(--rule);
+}
+.install-btn{
+  display:flex; align-items:center; gap:9px;
+  font-family:var(--font-ui); font-size:13px; font-weight:600;
+  color:#fff; background:var(--brand); border:none; border-radius:9px;
+  padding:9px 11px; cursor:pointer; box-shadow:var(--shadow-sm);
+  transition:filter .15s, transform .12s, box-shadow .15s;
+}
+.install-btn:hover{filter:brightness(1.08); box-shadow:var(--shadow-md); transform:translateY(-1px);}
+.install-btn:active{transform:translateY(0);}
+.install-btn svg{flex-shrink:0;}
+
 .main-col{flex:1; min-width:0; padding:32px 34px 60px;}
 main{max-width:1180px;}
 
@@ -360,7 +375,7 @@ label{
   margin-bottom:5px;
   text-transform:none;
 }
-select, input[type=date], input[type=number], input[type=text], textarea{
+select, input[type=date], input[type=number], input[type=text], input[type=email], input[type=password], textarea{
   width:100%;
   font-family:var(--font-ui);
   font-size:13.5px;
@@ -621,6 +636,31 @@ textarea{min-height:46px; resize:vertical; font-family:var(--font-ui);}
 .today-lesson-action{padding-top:14px; border-top:1px solid var(--rule);}
 .today-lesson-hint{font-size:11.5px; color:var(--ink-mute); margin:0 0 10px;}
 
+/* ---------- ressources recommandées par l'IA (gratuit/payant) ---------- */
+.resource-list{margin:0 0 16px; display:flex; flex-direction:column; gap:6px;}
+.resource-list-title{
+  font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
+  color:var(--ink-mute); margin:0 0 2px;
+}
+.resource-chip{
+  display:flex; align-items:baseline; flex-wrap:wrap; column-gap:8px; row-gap:2px;
+  font-size:12.5px; padding:7px 10px; background:var(--paper); border-radius:9px;
+}
+.resource-chip-badge{
+  font-family:var(--font-mono); font-size:9.5px; font-weight:700; text-transform:uppercase;
+  padding:2px 7px; border-radius:6px; flex-shrink:0;
+}
+.resource-free{background:var(--finance-bg); color:var(--finance);}
+.resource-paid{background:var(--tech-bg); color:var(--tech);}
+.resource-freemium{background:var(--anglais-bg); color:var(--anglais);}
+.resource-chip-name{font-weight:600; color:var(--ink);}
+.resource-chip-note{color:var(--ink-mute); font-size:11.5px; flex-basis:100%;}
+
+.resource-list-compact{margin:6px 0 0; gap:4px;}
+.resource-list-compact .resource-chip{
+  padding:3px 8px; background:transparent; border:1px solid var(--rule-strong); font-size:10.5px;
+}
+
 .btn-lesson{
   font-family:var(--font-ui); font-size:12.5px; font-weight:600; color:#fff;
   background:var(--m-color, var(--ink)); border:none; border-radius:var(--radius-md);
@@ -672,8 +712,13 @@ textarea{min-height:46px; resize:vertical; font-family:var(--font-ui);}
 }
 .chat-bubble-error{color:var(--projet); background:var(--projet-bg);}
 .chat-bubble-loading{display:flex; align-items:center; gap:9px; color:var(--ink-mute); font-style:italic;}
-.chat-time-reply{display:flex; align-items:center; gap:8px; align-self:flex-start;}
+.chat-time-reply{
+  display:flex; flex-direction:column; align-items:flex-start; gap:10px;
+  align-self:flex-start; background:var(--paper); border-radius:14px;
+  border-bottom-left-radius:4px; padding:12px 14px; max-width:88%;
+}
 .chat-time-reply input[type=time]{width:auto;}
+.chat-time-reply .day-picker{margin-bottom:2px;}
 
 .chat-composer{
   display:flex; flex-direction:column; gap:9px; padding-top:14px; border-top:1px solid var(--rule);
@@ -891,6 +936,7 @@ textarea{min-height:46px; resize:vertical; font-family:var(--font-ui);}
   border-top:1px solid var(--rule);
   font-size:11.5px;
   color:var(--ink-mute);
+  gap:10px;
 }
 
 /* ---------- api status ---------- */

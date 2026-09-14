@@ -190,15 +190,19 @@ générique du type "continue comme ça". Pas de formule d'ouverture ni de signa
 const VALID_DAY_NAMES = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
 
 function validateObjectivePlanShape(data) {
+  const daysValid =
+    data.schedule &&
+    (data.schedule.days === null ||
+      (Array.isArray(data.schedule.days) &&
+        data.schedule.days.length &&
+        data.schedule.days.every((d) => VALID_DAY_NAMES.includes(d))));
   if (
     !data ||
     typeof data.module !== "string" ||
     !Array.isArray(data.chapters) ||
     data.chapters.length < 2 ||
     !data.schedule ||
-    !Array.isArray(data.schedule.days) ||
-    !data.schedule.days.length ||
-    !data.schedule.days.every((d) => VALID_DAY_NAMES.includes(d)) ||
+    !daysValid ||
     typeof data.schedule.duration_minutes !== "number" ||
     (data.schedule.start_time !== null && typeof data.schedule.start_time !== "string")
   ) {
@@ -207,6 +211,20 @@ function validateObjectivePlanShape(data) {
   data.chapters.forEach((c) => {
     if (typeof c.label !== "string" || typeof c.description !== "string") {
       throw fail("Réponse IA invalide : chapitre mal formé.", 502);
+    }
+    // "resources" est optionnel (l'IA peut l'omettre, ou renvoyer null quand
+    // elle n'a rien de fiable à suggérer) — validé seulement s'il est un
+    // tableau réellement présent, jamais bloquant sinon.
+    if (c.resources !== undefined && c.resources !== null) {
+      const validTypes = ["gratuit", "payant", "gratuit/payant"];
+      if (
+        !Array.isArray(c.resources) ||
+        !c.resources.every(
+          (r) => r && typeof r.name === "string" && validTypes.includes(r.type) && typeof r.note === "string"
+        )
+      ) {
+        throw fail("Réponse IA invalide : ressources mal formées.", 502);
+      }
     }
   });
 }
@@ -237,11 +255,26 @@ suivre (ex. "le programme du DCG UE9", "le référentiel du concours X", "le som
 ses grandes parties comme trame des chapitres plutôt que d'improviser un découpage générique. Si
 aucune référence n'est donnée, construis le découpage toi-même à partir de ton expertise du domaine.
 
+Pour CHAQUE chapitre, recommande aussi 1 à 3 ressources externes réelles et pertinentes pour
+l'étudier (cours en ligne, chaîne ou vidéo, plateforme d'apprentissage, livre de référence...),
+en mélangeant gratuit et payant quand c'est pertinent plutôt que de toujours proposer la même
+chose — adapte au domaine (ex. langue : Duolingo, italki, YouTube ; programmation : freeCodeCamp,
+Udemy, la documentation officielle ; comptabilité/gestion : OpenClassrooms, Coursera, un manuel de
+référence ; concours : annales officielles, une prépa en ligne). Le champ "type" de chaque ressource
+doit valoir EXACTEMENT "gratuit", "payant", ou "gratuit/payant" (pour une plateforme freemium,
+gratuite avec un palier payant, ex. Duolingo) — jamais une autre valeur. N'invente jamais une URL
+précise — cite seulement le nom de la plateforme/du cours/du livre, jamais un lien. Si tu ne connais
+aucune ressource fiable et pertinente pour un chapitre donné, laisse "resources" à un tableau vide
+plutôt que d'inventer un nom qui n'existe pas.
+
 Étape 2 — Propose un planning pour étudier ces chapitres (une session par chapitre) :
 - "days" : les jours de la semaine à utiliser, parmi Lundi/Mardi/Mercredi/Jeudi/Vendredi/Samedi/Dimanche.
-  Si le message précise une fréquence ou des jours (ex. "tous les jours", "le week-end",
-  "3 fois par semaine"), respecte-la exactement. Sinon, choisis toi-même un rythme raisonnable
-  (ni trop lâche ni épuisant) adapté à l'ampleur de l'objectif.
+  Déduis-les UNIQUEMENT si le message donne une indication de fréquence ou de jours, même
+  approximative (ex. "tous les jours" → les 7 jours, "le week-end" → Samedi/Dimanche, "3 fois par
+  semaine" → 3 jours non consécutifs de ton choix, "les soirs de semaine" → Lundi à Vendredi). Si le
+  message ne dit vraiment rien sur la fréquence ou les jours, mets "days" à null plutôt que
+  d'inventer un rythme — ce point sera alors demandé séparément à l'apprenant(e), exactement comme
+  pour l'heure ci-dessous.
 - "duration_minutes" : la durée d'une session, en minutes. Si le message la précise, utilise-la.
   Sinon choisis une durée raisonnable selon la nature du chapitre (ex. 30 à 60).
 - "start_time" : l'heure de la session, au format "HH:MM". Déduis-la UNIQUEMENT si le message
@@ -254,7 +287,14 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, exactement dan
 {
   "module": "nom du module (court, descriptif)",
   "chapters": [
-    {"label": "titre du chapitre", "description": "une phrase sur ce qu'il couvre"}
+    {
+      "label": "titre du chapitre",
+      "description": "une phrase sur ce qu'il couvre",
+      "resources": [
+        {"name": "nom de la plateforme, du cours ou du livre", "type": "gratuit", "note": "pourquoi ce choix, une phrase"},
+        {"name": "...", "type": "payant", "note": "..."}
+      ]
+    }
   ],
   "schedule": {
     "days": ["Lundi", "Mercredi", "Vendredi"],

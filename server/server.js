@@ -3,26 +3,100 @@
 // REST utilisée par public/js/app.js. Toutes les routes sont préfixées
 // par /api. Chaque route est volontairement courte et lit/écrit une
 // seule table pour rester facile à suivre.
+//
+// Chaque compte a son propre espace isolé (sa propre base SQLite, voir
+// db.js) : toutes les routes ci-dessous lisent/écrivent `req.db`, jamais une
+// base globale. `req.db` est attaché par le middleware d'authentification
+// (auth.requireAuth) une fois la session vérifiée — voir plus bas.
 
 const express = require("express");
 const path = require("path");
-const db = require("./db");
+const { getDb, adoptLegacyDbIfPresent, seedLegacyDefaults } = require("./db");
+const accountsDb = require("./accounts-db");
+const auth = require("./auth");
 const seedQuizzes = require("./seed-quiz");
 const ai = require("./ai");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Synchronise les quiz de quizzes-data.js avec la base à chaque démarrage.
-// N'insère que les mois absents — ne touche jamais aux quiz déjà présents
-// ni à leur historique de tentatives.
-const seedResult = seedQuizzes(db);
-if (seedResult.inserted > 0) {
-  console.log(`Quiz ajouté(s) au démarrage : ${seedResult.months.join(", ")}`);
-}
-
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
+
+/* ================= AUTHENTIFICATION ================= */
+// Un compte = un espace totalement isolé (sa propre base SQLite). Pas de
+// vérification d'email, pas de récupération de mot de passe (pas
+// d'infrastructure d'envoi d'email ici) — volontairement minimal pour un
+// usage personnel/auto-hébergé. Ces 4 routes sont les SEULES routes /api/*
+// accessibles sans session valide.
+
+app.post("/api/auth/register", (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password || password.length < 8) {
+    return res.status(400).json({ error: "Email et mot de passe (8 caractères min.) sont obligatoires." });
+  }
+  const isFirstAccount = accountsDb.prepare("SELECT COUNT(*) AS n FROM accounts").get().n === 0;
+  // scryptSync est synchrone : aucun `await` entre la vérification
+  // isFirstAccount et l'INSERT ci-dessous, donc aucune fenêtre de course
+  // possible entre deux inscriptions concurrentes qui se disputeraient le
+  // statut de "premier compte".
+  const password_hash = auth.hashPassword(password);
+  let info;
+  try {
+    info = accountsDb
+      .prepare("INSERT INTO accounts (email, password_hash) VALUES (?, ?)")
+      .run(email.toLowerCase().trim(), password_hash);
+  } catch (e) {
+    return res.status(409).json({ error: "Cet email est déjà utilisé." });
+  }
+  if (isFirstAccount && adoptLegacyDbIfPresent(info.lastInsertRowid)) {
+    // Ce compte hérite du data.sqlite historique (les vraies données
+    // existantes) plutôt que de démarrer vide.
+    const db = getDb(info.lastInsertRowid);
+    seedLegacyDefaults(db); // no-op défensif : les tables sont déjà non vides
+    seedQuizzes(db); // garde le comportement historique pour CE compte précis
+  } else {
+    getDb(info.lastInsertRowid); // nouveau compte : espace vide, rien de plus
+  }
+  const { token, expiresAt } = auth.createSession(info.lastInsertRowid);
+  auth.setSessionCookie(res, token, expiresAt);
+  res.status(201).json({ id: info.lastInsertRowid, email: email.toLowerCase().trim() });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email et mot de passe sont obligatoires." });
+  }
+  const account = accountsDb
+    .prepare("SELECT * FROM accounts WHERE email = ?")
+    .get(email.toLowerCase().trim());
+  if (!account || !auth.verifyPassword(password, account.password_hash)) {
+    return res.status(401).json({ error: "Identifiants invalides." });
+  }
+  const { token, expiresAt } = auth.createSession(account.id);
+  auth.setSessionCookie(res, token, expiresAt);
+  res.json({ id: account.id, email: account.email });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const cookies = auth.parseCookies(req);
+  if (cookies.gl_session) auth.destroySession(cookies.gl_session);
+  auth.clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// Réutilise directement requireAuth : session valide -> renvoie le compte,
+// session absente/expirée -> requireAuth répond déjà 401, exactement le
+// signal attendu côté frontend pour savoir s'il faut afficher l'écran de
+// connexion.
+app.get("/api/auth/me", auth.requireAuth, (req, res) => {
+  res.json({ id: req.account.id, email: req.account.email });
+});
+
+// À partir d'ici, toute route /api/* exige une session valide et travaille
+// exclusivement sur req.db (l'espace isolé du compte connecté).
+app.use("/api", auth.requireAuth);
 
 /* ================= aide : calendrier ================= */
 // Utilisé pour planifier les chapitres générés par IA sur de vraies dates,
@@ -72,7 +146,7 @@ function scheduleDates(availableDayNames, count) {
 
 // Liste des écritures, les plus récentes en premier.
 app.get("/api/journal", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare("SELECT * FROM journal_entries ORDER BY date DESC, id DESC")
     .all();
   res.json(rows);
@@ -85,7 +159,7 @@ app.post("/api/journal", (req, res) => {
   if (!date || !domain) {
     return res.status(400).json({ error: "date et domain sont obligatoires." });
   }
-  const info = db
+  const info = req.db
     .prepare(
       `INSERT INTO journal_entries (date, domain, learned, can_do, difficult)
        VALUES (?, ?, ?, ?, ?)`
@@ -102,7 +176,7 @@ app.post("/api/journal", (req, res) => {
 
 // month attendu au format "AAAA-MM" (ex. "2026-09").
 app.get("/api/calendar/:month", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare(
       "SELECT date, domain, learned, can_do, difficult FROM journal_entries WHERE date LIKE ? ORDER BY date ASC"
     )
@@ -123,7 +197,7 @@ app.get("/api/calendar/:month", (req, res) => {
 
 // Toutes les tâches d'une semaine, triées par jour puis par ordre d'ajout.
 app.get("/api/week/:weekStart", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare(
       "SELECT * FROM week_tasks WHERE week_start = ? ORDER BY sort_order ASC, id ASC"
     )
@@ -137,12 +211,12 @@ app.post("/api/week/:weekStart", (req, res) => {
   if (!day || !text) {
     return res.status(400).json({ error: "day et text sont obligatoires." });
   }
-  const maxOrder = db
+  const maxOrder = req.db
     .prepare(
       "SELECT COALESCE(MAX(sort_order), -1) AS m FROM week_tasks WHERE week_start = ? AND day = ?"
     )
     .get(req.params.weekStart, day).m;
-  const info = db
+  const info = req.db
     .prepare(
       `INSERT INTO week_tasks (week_start, day, text, domain, status, sort_order)
        VALUES (?, ?, ?, ?, 'todo', ?)`
@@ -161,8 +235,8 @@ app.post("/api/week-tasks/reorder", (req, res) => {
   if (!day || !Array.isArray(order)) {
     return res.status(400).json({ error: "day et order (tableau d'ids) sont obligatoires." });
   }
-  const update = db.prepare("UPDATE week_tasks SET day = ?, sort_order = ? WHERE id = ?");
-  const reorder = db.transaction((ids) => {
+  const update = req.db.prepare("UPDATE week_tasks SET day = ?, sort_order = ? WHERE id = ?");
+  const reorder = req.db.transaction((ids) => {
     ids.forEach((id, i) => update.run(day, i, id));
   });
   reorder(order);
@@ -172,9 +246,9 @@ app.post("/api/week-tasks/reorder", (req, res) => {
 // Met à jour une tâche existante. Corps : { status } et/ou { text, domain }
 app.post("/api/week-tasks/:id", (req, res) => {
   const { status, text, domain, day } = req.body;
-  const task = db.prepare("SELECT * FROM week_tasks WHERE id = ?").get(req.params.id);
+  const task = req.db.prepare("SELECT * FROM week_tasks WHERE id = ?").get(req.params.id);
   if (!task) return res.status(404).json({ error: "Tâche introuvable." });
-  db.prepare(
+  req.db.prepare(
     `UPDATE week_tasks SET status = ?, text = ?, domain = ?, day = ? WHERE id = ?`
   ).run(
     status || task.status,
@@ -188,7 +262,7 @@ app.post("/api/week-tasks/:id", (req, res) => {
 
 // Supprime une tâche.
 app.delete("/api/week-tasks/:id", (req, res) => {
-  db.prepare("DELETE FROM week_tasks WHERE id = ?").run(req.params.id);
+  req.db.prepare("DELETE FROM week_tasks WHERE id = ?").run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -196,7 +270,7 @@ app.delete("/api/week-tasks/:id", (req, res) => {
 
 // Scores /10 des 5 domaines pour un mois donné (clé = "Sept. 2026" etc.)
 app.get("/api/month/:month", (req, res) => {
-  const row = db
+  const row = req.db
     .prepare("SELECT * FROM month_scores WHERE month = ?")
     .get(req.params.month);
   res.json(row || {});
@@ -205,7 +279,7 @@ app.get("/api/month/:month", (req, res) => {
 // Enregistre les 5 notes du mois. Corps : { finance, concours, anglais, tech, projet }
 app.post("/api/month/:month", (req, res) => {
   const { finance, concours, anglais, tech, projet } = req.body;
-  db.prepare(
+  req.db.prepare(
     `INSERT INTO month_scores (month, finance, concours, anglais, tech, projet)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(month) DO UPDATE SET
@@ -217,14 +291,14 @@ app.post("/api/month/:month", (req, res) => {
 
 // Toutes les moyennes mensuelles en une fois, pour tracer la courbe de tendance.
 app.get("/api/month-scores", (req, res) => {
-  const rows = db.prepare("SELECT * FROM month_scores").all();
+  const rows = req.db.prepare("SELECT * FROM month_scores").all();
   res.json(rows);
 });
 
 /* ================= DASHBOARD ================= */
 
 app.get("/api/dashboard", (req, res) => {
-  const rows = db.prepare("SELECT domain, status FROM dashboard_status").all();
+  const rows = req.db.prepare("SELECT domain, status FROM dashboard_status").all();
   const result = {};
   rows.forEach((r) => (result[r.domain] = r.status));
   res.json(result);
@@ -236,7 +310,7 @@ app.post("/api/dashboard", (req, res) => {
   if (!domain || !status) {
     return res.status(400).json({ error: "domain et status sont obligatoires." });
   }
-  db.prepare(
+  req.db.prepare(
     `INSERT INTO dashboard_status (domain, status) VALUES (?, ?)
      ON CONFLICT(domain) DO UPDATE SET status = excluded.status`
   ).run(domain, status);
@@ -246,7 +320,7 @@ app.post("/api/dashboard", (req, res) => {
 /* ================= JALONS ================= */
 
 app.get("/api/milestones", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare("SELECT * FROM milestones ORDER BY sort_order ASC")
     .all();
   res.json(rows);
@@ -258,8 +332,8 @@ app.post("/api/milestones", (req, res) => {
   if (!label || !date_label) {
     return res.status(400).json({ error: "label et date_label sont obligatoires." });
   }
-  const maxOrder = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM milestones").get().m;
-  const info = db
+  const maxOrder = req.db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM milestones").get().m;
+  const info = req.db
     .prepare(
       `INSERT INTO milestones (label, date_label, status, sort_order)
        VALUES (?, ?, 'Pas commencé', ?)`
@@ -271,9 +345,9 @@ app.post("/api/milestones", (req, res) => {
 // Met à jour un jalon existant. Corps : n'importe lequel de { label, date_label, status }
 app.post("/api/milestones/:id", (req, res) => {
   const { label, date_label, status } = req.body;
-  const existing = db.prepare("SELECT * FROM milestones WHERE id = ?").get(req.params.id);
+  const existing = req.db.prepare("SELECT * FROM milestones WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "Jalon introuvable." });
-  db.prepare("UPDATE milestones SET label = ?, date_label = ?, status = ? WHERE id = ?").run(
+  req.db.prepare("UPDATE milestones SET label = ?, date_label = ?, status = ? WHERE id = ?").run(
     label != null ? label : existing.label,
     date_label != null ? date_label : existing.date_label,
     status || existing.status,
@@ -284,7 +358,7 @@ app.post("/api/milestones/:id", (req, res) => {
 
 // Supprime un jalon.
 app.delete("/api/milestones/:id", (req, res) => {
-  db.prepare("DELETE FROM milestones WHERE id = ?").run(req.params.id);
+  req.db.prepare("DELETE FROM milestones WHERE id = ?").run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -294,8 +368,8 @@ app.post("/api/milestones-reorder", (req, res) => {
   if (!Array.isArray(order)) {
     return res.status(400).json({ error: "order (tableau d'ids) est obligatoire." });
   }
-  const update = db.prepare("UPDATE milestones SET sort_order = ? WHERE id = ?");
-  const reorder = db.transaction((ids) => {
+  const update = req.db.prepare("UPDATE milestones SET sort_order = ? WHERE id = ?");
+  const reorder = req.db.transaction((ids) => {
     ids.forEach((id, i) => update.run(i, id));
   });
   reorder(order);
@@ -308,8 +382,11 @@ app.post("/api/milestones-reorder", (req, res) => {
 // table séparée) — le regroupement par module se fait côté client.
 
 app.get("/api/programme", (req, res) => {
-  const rows = db.prepare("SELECT * FROM programme_chapters ORDER BY sort_order ASC").all();
-  res.json(rows);
+  const rows = req.db.prepare("SELECT * FROM programme_chapters ORDER BY sort_order ASC").all();
+  res.json(rows.map((r) => {
+    const { resources_json, ...rest } = r;
+    return { ...rest, resources: JSON.parse(resources_json || "[]") };
+  }));
 });
 
 // Ajoute un chapitre. Corps : { module, label, description, month_label }
@@ -318,8 +395,8 @@ app.post("/api/programme", (req, res) => {
   if (!module || !label) {
     return res.status(400).json({ error: "module et label sont obligatoires." });
   }
-  const maxOrder = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM programme_chapters").get().m;
-  const info = db
+  const maxOrder = req.db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM programme_chapters").get().m;
+  const info = req.db
     .prepare(
       `INSERT INTO programme_chapters (module, label, description, month_label, status, sort_order)
        VALUES (?, ?, ?, ?, 'Pas commencé', ?)`
@@ -331,9 +408,9 @@ app.post("/api/programme", (req, res) => {
 // Met à jour un chapitre. Corps : tout ou partie de { label, description, month_label, status }
 app.post("/api/programme/:id", (req, res) => {
   const { label, description, month_label, status, module } = req.body;
-  const existing = db.prepare("SELECT * FROM programme_chapters WHERE id = ?").get(req.params.id);
+  const existing = req.db.prepare("SELECT * FROM programme_chapters WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "Chapitre introuvable." });
-  db.prepare(
+  req.db.prepare(
     "UPDATE programme_chapters SET label = ?, description = ?, month_label = ?, status = ?, module = ? WHERE id = ?"
   ).run(
     label != null ? label : existing.label,
@@ -349,9 +426,9 @@ app.post("/api/programme/:id", (req, res) => {
 // Supprime un chapitre. Les créneaux d'emploi du temps qui le référençaient
 // perdent juste leur lien (chapter_id à NULL) — le créneau n'est pas effacé.
 app.delete("/api/programme/:id", (req, res) => {
-  const del = db.transaction((id) => {
-    db.prepare("UPDATE schedule_slots SET chapter_id = NULL WHERE chapter_id = ?").run(id);
-    db.prepare("DELETE FROM programme_chapters WHERE id = ?").run(id);
+  const del = req.db.transaction((id) => {
+    req.db.prepare("UPDATE schedule_slots SET chapter_id = NULL WHERE chapter_id = ?").run(id);
+    req.db.prepare("DELETE FROM programme_chapters WHERE id = ?").run(id);
   });
   del(req.params.id);
   res.json({ ok: true });
@@ -363,10 +440,10 @@ app.delete("/api/programme/:id", (req, res) => {
 // suppression d'un chapitre seul : ils perdent juste leur lien, pas supprimés.
 app.delete("/api/programme/module/:name", (req, res) => {
   const moduleName = decodeURIComponent(req.params.name);
-  const del = db.transaction((name) => {
-    const ids = db.prepare("SELECT id FROM programme_chapters WHERE module = ?").all(name).map((r) => r.id);
-    const nullSlot = db.prepare("UPDATE schedule_slots SET chapter_id = NULL WHERE chapter_id = ?");
-    const delChapter = db.prepare("DELETE FROM programme_chapters WHERE id = ?");
+  const del = req.db.transaction((name) => {
+    const ids = req.db.prepare("SELECT id FROM programme_chapters WHERE module = ?").all(name).map((r) => r.id);
+    const nullSlot = req.db.prepare("UPDATE schedule_slots SET chapter_id = NULL WHERE chapter_id = ?");
+    const delChapter = req.db.prepare("DELETE FROM programme_chapters WHERE id = ?");
     ids.forEach((id) => { nullSlot.run(id); delChapter.run(id); });
     return ids.length;
   });
@@ -384,8 +461,8 @@ app.post("/api/programme-reorder", (req, res) => {
   if (!module || !Array.isArray(order)) {
     return res.status(400).json({ error: "module et order (tableau d'ids) sont obligatoires." });
   }
-  const update = db.prepare("UPDATE programme_chapters SET module = ?, sort_order = ? WHERE id = ?");
-  const reorder = db.transaction((ids) => {
+  const update = req.db.prepare("UPDATE programme_chapters SET module = ?, sort_order = ? WHERE id = ?");
+  const reorder = req.db.transaction((ids) => {
     ids.forEach((id, i) => update.run(module, i, id));
   });
   reorder(order);
@@ -397,16 +474,16 @@ app.post("/api/programme-reorder", (req, res) => {
 // ensuite normalement dans l'onglet Quiz. Ne fait rien d'automatique :
 // appelée uniquement quand la personne clique sur le bouton correspondant.
 app.post("/api/programme/:id/generate-quiz", async (req, res) => {
-  const chapter = db.prepare("SELECT * FROM programme_chapters WHERE id = ?").get(req.params.id);
+  const chapter = req.db.prepare("SELECT * FROM programme_chapters WHERE id = ?").get(req.params.id);
   if (!chapter) return res.status(404).json({ error: "Chapitre introuvable." });
   try {
     const quiz = await ai.generateQuiz(chapter);
-    const insertQuiz = db.prepare("INSERT INTO quizzes (month, title, chapter_id) VALUES (?, ?, ?)");
-    const insertQuestion = db.prepare(
+    const insertQuiz = req.db.prepare("INSERT INTO quizzes (month, title, chapter_id) VALUES (?, ?, ?)");
+    const insertQuestion = req.db.prepare(
       `INSERT INTO quiz_questions (quiz_id, prompt, options_json, correct_option_id, explanation, sort_order)
        VALUES (?, ?, ?, ?, ?, ?)`
     );
-    const create = db.transaction(() => {
+    const create = req.db.transaction(() => {
       const quizId = insertQuiz.run(chapter.month_label || null, quiz.title, chapter.id).lastInsertRowid;
       quiz.questions.forEach((q, i) => {
         insertQuestion.run(quizId, q.prompt, JSON.stringify(q.options), q.correct, q.explanation, i);
@@ -422,13 +499,15 @@ app.post("/api/programme/:id/generate-quiz", async (req, res) => {
 // Insère un module de chapitres + leurs créneaux, répartis sur les
 // prochaines dates correspondant aux jours fournis. Partagé par les deux
 // routes ci-dessous (génération directe et finalisation après clarification
-// de l'heure) pour ne pas dupliquer la logique de planification.
-function persistObjective(module, chapters, days, start_time, duration_minutes) {
+// de l'heure) pour ne pas dupliquer la logique de planification. Reçoit `db`
+// en paramètre explicite (l'espace du compte courant) plutôt que de capturer
+// une base globale.
+function persistObjective(db, module, chapters, days, start_time, duration_minutes) {
   const dates = scheduleDates(days, chapters.length);
 
   const insertChapter = db.prepare(
-    `INSERT INTO programme_chapters (module, label, description, month_label, status, sort_order)
-     VALUES (?, ?, ?, ?, 'Pas commencé', ?)`
+    `INSERT INTO programme_chapters (module, label, description, month_label, status, sort_order, resources_json)
+     VALUES (?, ?, ?, ?, 'Pas commencé', ?, ?)`
   );
   const insertSlot = db.prepare(
     `INSERT INTO schedule_slots (week_start, day, start_time, duration_minutes, chapter_id, done, sort_order)
@@ -443,7 +522,7 @@ function persistObjective(module, chapters, days, start_time, duration_minutes) 
       const weekStart = isoDate(mondayOf(date));
       const day = DAY_NAMES[date.getDay()];
       const chapterId = insertChapter.run(
-        module, c.label, c.description, formatDateLabel(date), maxOrder + 1 + i
+        module, c.label, c.description, formatDateLabel(date), maxOrder + 1 + i, JSON.stringify(c.resources || [])
       ).lastInsertRowid;
 
       const cacheKey = weekStart + "|" + day;
@@ -454,7 +533,10 @@ function persistObjective(module, chapters, days, start_time, duration_minutes) 
       }
       insertSlot.run(weekStart, day, start_time, duration_minutes || 60, chapterId, slotOrderCache[cacheKey]++);
 
-      return { id: chapterId, label: c.label, description: c.description, date_label: formatDateLabel(date), day };
+      return {
+        id: chapterId, label: c.label, description: c.description,
+        date_label: formatDateLabel(date), day, resources: c.resources || []
+      };
     });
   });
 
@@ -464,10 +546,11 @@ function persistObjective(module, chapters, days, start_time, duration_minutes) 
 // Crée un nouvel objectif à partir d'un message libre : l'IA le découpe en
 // chapitres ET propose un planning (jours/durée/heure), en respectant les
 // préférences données dans le message quand elles y sont. Si l'IA ne peut
-// déduire aucune heure du message, rien n'est enregistré : on renvoie le
-// plan tel quel avec needs_time=true, et le client renvoie l'heure choisie
-// par la personne à /api/objectives/finalize pour terminer la création
-// (évite de rappeler l'IA une seconde fois pour la même génération).
+// déduire les jours et/ou l'heure du message, rien n'est enregistré : on
+// renvoie le plan tel quel avec needs_schedule=true (en précisant ce qui
+// manque), et le client renvoie les jours/l'heure choisis par la personne à
+// /api/objectives/finalize pour terminer la création (évite de rappeler
+// l'IA une seconde fois pour la même génération).
 // Corps : { message }
 app.post("/api/objectives/generate", async (req, res) => {
   const { message } = req.body;
@@ -478,13 +561,14 @@ app.post("/api/objectives/generate", async (req, res) => {
     const plan = await ai.generateObjectivePlan(message.trim());
     const { days, duration_minutes, start_time } = plan.schedule;
 
-    if (!start_time) {
+    if (!days || !start_time) {
       return res.status(200).json({
-        needs_time: true, module: plan.module, chapters: plan.chapters, days, duration_minutes
+        needs_schedule: true, module: plan.module, chapters: plan.chapters,
+        days: days || null, duration_minutes, start_time: start_time || null
       });
     }
 
-    const chapters = persistObjective(plan.module, plan.chapters, days, start_time, duration_minutes);
+    const chapters = persistObjective(req.db, plan.module, plan.chapters, days, start_time, duration_minutes);
     res.status(201).json({ module: plan.module, chapters, days, start_time, duration_minutes });
   } catch (e) {
     res.status(e.statusCode || 502).json({ error: e.message });
@@ -500,7 +584,7 @@ app.post("/api/objectives/finalize", (req, res) => {
   if (!module || !Array.isArray(chapters) || !chapters.length || !Array.isArray(days) || !days.length || !start_time) {
     return res.status(400).json({ error: "module, chapters, days et start_time sont obligatoires." });
   }
-  const created = persistObjective(module, chapters, days, start_time, duration_minutes);
+  const created = persistObjective(req.db, module, chapters, days, start_time, duration_minutes);
   res.status(201).json({ module, chapters: created });
 });
 
@@ -513,9 +597,9 @@ app.post("/api/objectives/finalize", (req, res) => {
 // conservé même sans onglet dédié).
 
 app.get("/api/today", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare(
-      `SELECT c.id, c.module, c.label, c.description, c.status,
+      `SELECT c.id, c.module, c.label, c.description, c.status, c.resources_json,
               s.week_start, s.day, s.start_time, s.duration_minutes
        FROM programme_chapters c
        JOIN schedule_slots s ON s.chapter_id = c.id
@@ -530,11 +614,15 @@ app.get("/api/today", (req, res) => {
     .map((r) => ({ ...r, _date: dateOfSlot(r) }))
     .sort((a, b) => a._date - b._date)
     .map((r) => {
-      const quiz = db
+      const quiz = req.db
         .prepare("SELECT id, title FROM quizzes WHERE chapter_id = ? ORDER BY id DESC LIMIT 1")
         .get(r.id);
-      const { _date, week_start, day, ...rest } = r;
-      return { ...rest, date_label: formatDateLabel(_date), quiz_id: quiz ? quiz.id : null, quiz_title: quiz ? quiz.title : null, _due: _date <= today };
+      const { _date, week_start, day, resources_json, ...rest } = r;
+      return {
+        ...rest, date_label: formatDateLabel(_date),
+        resources: JSON.parse(resources_json || "[]"),
+        quiz_id: quiz ? quiz.id : null, quiz_title: quiz ? quiz.title : null, _due: _date <= today
+      };
     });
 
   const due = withDate.filter((r) => r._due).map(({ _due, ...r }) => r);
@@ -551,7 +639,7 @@ app.get("/api/today", (req, res) => {
 
 // Tous les créneaux d'une semaine, avec le chapitre lié (label/module/statut).
 app.get("/api/schedule/:weekStart", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare(
       `SELECT s.*, c.label AS chapter_label, c.module AS chapter_module, c.status AS chapter_status
        FROM schedule_slots s LEFT JOIN programme_chapters c ON c.id = s.chapter_id
@@ -568,10 +656,10 @@ app.post("/api/schedule/:weekStart", (req, res) => {
   if (!day || !start_time) {
     return res.status(400).json({ error: "day et start_time sont obligatoires." });
   }
-  const maxOrder = db
+  const maxOrder = req.db
     .prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM schedule_slots WHERE week_start = ? AND day = ?")
     .get(req.params.weekStart, day).m;
-  const info = db
+  const info = req.db
     .prepare(
       `INSERT INTO schedule_slots (week_start, day, start_time, duration_minutes, chapter_id, done, sort_order)
        VALUES (?, ?, ?, ?, ?, 0, ?)`
@@ -584,9 +672,9 @@ app.post("/api/schedule/:weekStart", (req, res) => {
 // { day, start_time, duration_minutes, chapter_id, done }
 app.post("/api/schedule-slots/:id", (req, res) => {
   const { day, start_time, duration_minutes, chapter_id, done } = req.body;
-  const existing = db.prepare("SELECT * FROM schedule_slots WHERE id = ?").get(req.params.id);
+  const existing = req.db.prepare("SELECT * FROM schedule_slots WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "Créneau introuvable." });
-  db.prepare(
+  req.db.prepare(
     `UPDATE schedule_slots SET day = ?, start_time = ?, duration_minutes = ?, chapter_id = ?, done = ? WHERE id = ?`
   ).run(
     day || existing.day,
@@ -601,7 +689,7 @@ app.post("/api/schedule-slots/:id", (req, res) => {
 
 // Supprime un créneau.
 app.delete("/api/schedule-slots/:id", (req, res) => {
-  db.prepare("DELETE FROM schedule_slots WHERE id = ?").run(req.params.id);
+  req.db.prepare("DELETE FROM schedule_slots WHERE id = ?").run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -611,14 +699,14 @@ app.delete("/api/schedule-slots/:id", (req, res) => {
 
 // Liste des quiz disponibles (sans les questions).
 app.get("/api/quizzes", (req, res) => {
-  const rows = db.prepare("SELECT id, month, title FROM quizzes ORDER BY id ASC").all();
+  const rows = req.db.prepare("SELECT id, month, title FROM quizzes ORDER BY id ASC").all();
   res.json(rows);
 });
 
 // Un quiz avec ses questions — sans la bonne réponse ni l'explication,
 // pour ne pas les exposer avant que la personne ait répondu.
 app.get("/api/quizzes/:id", (req, res) => {
-  const quiz = db
+  const quiz = req.db
     .prepare(
       `SELECT q.id, q.month, q.title, q.chapter_id, c.label AS chapter_label, c.status AS chapter_status
        FROM quizzes q LEFT JOIN programme_chapters c ON c.id = q.chapter_id
@@ -626,7 +714,7 @@ app.get("/api/quizzes/:id", (req, res) => {
     )
     .get(req.params.id);
   if (!quiz) return res.status(404).json({ error: "Quiz introuvable." });
-  const questions = db
+  const questions = req.db
     .prepare("SELECT id, prompt, options_json FROM quiz_questions WHERE quiz_id = ? ORDER BY sort_order ASC")
     .all(req.params.id)
     .map((q) => ({ id: q.id, prompt: q.prompt, options: JSON.parse(q.options_json) }));
@@ -639,8 +727,8 @@ app.post("/api/quizzes/:id/attempt", (req, res) => {
   if (!answers || typeof answers !== "object") {
     return res.status(400).json({ error: "answers est obligatoire." });
   }
-  const quiz = db.prepare("SELECT chapter_id FROM quizzes WHERE id = ?").get(req.params.id);
-  const questions = db
+  const quiz = req.db.prepare("SELECT chapter_id FROM quizzes WHERE id = ?").get(req.params.id);
+  const questions = req.db
     .prepare("SELECT id, correct_option_id, explanation FROM quiz_questions WHERE quiz_id = ? ORDER BY sort_order ASC")
     .all(req.params.id);
   if (!questions.length) return res.status(404).json({ error: "Quiz introuvable." });
@@ -662,13 +750,13 @@ app.post("/api/quizzes/:id/attempt", (req, res) => {
   const total = questions.length;
   const scorePct = Math.round((correctCount / total) * 100);
 
-  db.prepare(
+  req.db.prepare(
     "INSERT INTO quiz_attempts (quiz_id, score_pct, correct_count, total_count) VALUES (?, ?, ?, ?)"
   ).run(req.params.id, scorePct, correctCount, total);
 
   let chapterCompleted = false;
   if (quiz && quiz.chapter_id && scorePct >= CHAPTER_PASS_THRESHOLD) {
-    db.prepare("UPDATE programme_chapters SET status = 'Terminé' WHERE id = ?").run(quiz.chapter_id);
+    req.db.prepare("UPDATE programme_chapters SET status = 'Terminé' WHERE id = ?").run(quiz.chapter_id);
     chapterCompleted = true;
   }
 
@@ -688,7 +776,7 @@ app.post("/api/quizzes/:id/feedback", async (req, res) => {
   if (!Array.isArray(results) || !results.length) {
     return res.status(400).json({ error: "results est obligatoire." });
   }
-  const quiz = db.prepare("SELECT title FROM quizzes WHERE id = ?").get(req.params.id);
+  const quiz = req.db.prepare("SELECT title FROM quizzes WHERE id = ?").get(req.params.id);
   if (!quiz) return res.status(404).json({ error: "Quiz introuvable." });
   try {
     const feedback = await ai.generateFeedback(quiz.title, results);
@@ -700,7 +788,7 @@ app.post("/api/quizzes/:id/feedback", async (req, res) => {
 
 // Historique des tentatives pour un quiz, les plus récentes en premier.
 app.get("/api/quizzes/:id/attempts", (req, res) => {
-  const rows = db
+  const rows = req.db
     .prepare(
       "SELECT date, score_pct, correct_count, total_count FROM quiz_attempts WHERE quiz_id = ? ORDER BY date DESC"
     )
@@ -720,12 +808,12 @@ app.post("/api/quizzes", (req, res) => {
       return res.status(400).json({ error: "Chaque question doit avoir un énoncé, au moins 2 options et une réponse correcte." });
     }
   }
-  const insertQuiz = db.prepare("INSERT INTO quizzes (month, title) VALUES (?, ?)");
-  const insertQuestion = db.prepare(
+  const insertQuiz = req.db.prepare("INSERT INTO quizzes (month, title) VALUES (?, ?)");
+  const insertQuestion = req.db.prepare(
     `INSERT INTO quiz_questions (quiz_id, prompt, options_json, correct_option_id, explanation, sort_order)
      VALUES (?, ?, ?, ?, ?, ?)`
   );
-  const create = db.transaction(() => {
+  const create = req.db.transaction(() => {
     const quizId = insertQuiz.run(month || null, title).lastInsertRowid;
     questions.forEach((q, i) => {
       insertQuestion.run(
@@ -745,10 +833,10 @@ app.post("/api/quizzes", (req, res) => {
 
 // Supprime un quiz, ses questions et son historique de tentatives.
 app.delete("/api/quizzes/:id", (req, res) => {
-  const del = db.transaction((id) => {
-    db.prepare("DELETE FROM quiz_attempts WHERE quiz_id = ?").run(id);
-    db.prepare("DELETE FROM quiz_questions WHERE quiz_id = ?").run(id);
-    db.prepare("DELETE FROM quizzes WHERE id = ?").run(id);
+  const del = req.db.transaction((id) => {
+    req.db.prepare("DELETE FROM quiz_attempts WHERE quiz_id = ?").run(id);
+    req.db.prepare("DELETE FROM quiz_questions WHERE quiz_id = ?").run(id);
+    req.db.prepare("DELETE FROM quizzes WHERE id = ?").run(id);
   });
   del(req.params.id);
   res.json({ ok: true });
@@ -759,15 +847,15 @@ app.delete("/api/quizzes/:id", (req, res) => {
 // la personne clique sur "Actualiser" dans l'onglet Bilan, jamais toute seule.
 
 app.get("/api/insights", (req, res) => {
-  const row = db.prepare("SELECT content, created_at FROM ai_insights WHERE id = 1").get();
+  const row = req.db.prepare("SELECT content, created_at FROM ai_insights WHERE id = 1").get();
   res.json(row || null);
 });
 
 app.post("/api/insights/refresh", async (req, res) => {
   try {
-    const milestones = db.prepare("SELECT label, status FROM milestones ORDER BY sort_order ASC").all();
-    const chapters = db.prepare("SELECT module, label, status FROM programme_chapters ORDER BY sort_order ASC").all();
-    const recentAttempts = db
+    const milestones = req.db.prepare("SELECT label, status FROM milestones ORDER BY sort_order ASC").all();
+    const chapters = req.db.prepare("SELECT module, label, status FROM programme_chapters ORDER BY sort_order ASC").all();
+    const recentAttempts = req.db
       .prepare(
         `SELECT q.title AS title, a.score_pct, a.date
          FROM quiz_attempts a JOIN quizzes q ON q.id = a.quiz_id
@@ -775,7 +863,7 @@ app.post("/api/insights/refresh", async (req, res) => {
       )
       .all();
     const content = await ai.generateNextStepSuggestion({ milestones, chapters, recentAttempts });
-    db.prepare(
+    req.db.prepare(
       `INSERT INTO ai_insights (id, content, created_at) VALUES (1, ?, datetime('now'))
        ON CONFLICT(id) DO UPDATE SET content = excluded.content, created_at = excluded.created_at`
     ).run(content);
@@ -787,13 +875,13 @@ app.post("/api/insights/refresh", async (req, res) => {
 
 /* ================= RESET (protégé) ================= */
 
-// Efface toutes les données. Nécessite d'envoyer { confirm: "EFFACER" }
-// pour éviter un appel accidentel.
+// Efface toutes les données DU COMPTE COURANT. Nécessite d'envoyer
+// { confirm: "EFFACER" } pour éviter un appel accidentel.
 app.post("/api/reset", (req, res) => {
   if (req.body.confirm !== "EFFACER") {
     return res.status(400).json({ error: "Confirmation manquante." });
   }
-  db.exec(`
+  req.db.exec(`
     DELETE FROM journal_entries;
     DELETE FROM week_tasks;
     DELETE FROM schedule_slots;

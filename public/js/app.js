@@ -57,6 +57,20 @@ function moduleStyle(moduleName) {
   const key = moduleColorKey(moduleName);
   return { bg: "var(--" + key + "-bg)", fg: "var(--" + key + ")" };
 }
+
+// Ressources recommandées par l'IA (voir ai.generateObjectivePlan) : chaque
+// ressource a un type "gratuit", "payant", ou "gratuit/payant" (freemium,
+// ex. Duolingo) — ce badge affiche le bon libellé/couleur dans les deux
+// endroits où on les liste (Aujourd'hui et Programme).
+const RESOURCE_BADGE = {
+  "gratuit": { cls: "resource-free", label: "Gratuit" },
+  "payant": { cls: "resource-paid", label: "Payant" },
+  "gratuit/payant": { cls: "resource-freemium", label: "Freemium" }
+};
+function resourceBadge(type) {
+  return RESOURCE_BADGE[type] || RESOURCE_BADGE["payant"];
+}
+const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
 const MONTHS = ["Sept. 2026", "Oct. 2026", "Nov. 2026", "Déc. 2026", "Janv. 2027", "Fév. 2027",
   "Mars 2027", "Avr. 2027", "Mai 2027", "Juin 2027", "Juil. 2027", "Août 2027",
   "Sept. 2027", "Oct. 2027", "Nov. 2027", "Déc. 2027"];
@@ -146,20 +160,128 @@ const ConfirmDialog = {
   `
 };
 
+/* ================= authentification ================= */
+// Un compte = un espace isolé. `authState.checked` distingue "on n'a pas
+// encore vérifié" de "vérifié, personne connectée" — évite un flash de
+// l'écran de connexion pendant que /api/auth/me répond au tout premier
+// chargement (voir App plus bas).
+
+const authState = reactive({ checked: false, account: null });
+
+/* ================= installation PWA ================= */
+// Le navigateur ne montre son invite d'installation qu'une fois — on capture
+// l'événement dès qu'il arrive (avant même que Vue soit monté, d'où un state
+// au niveau module plutôt que dans un composant) pour pouvoir déclencher
+// l'installation depuis un bouton à nous, visible en permanence, plutôt que
+// de dépendre du menu du navigateur pour qu'on sache que l'app est installable.
+const pwaState = reactive({ promptEvent: null, installed: false });
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  pwaState.promptEvent = e;
+});
+window.addEventListener("appinstalled", () => {
+  pwaState.promptEvent = null;
+  pwaState.installed = true;
+});
+async function installApp() {
+  if (!pwaState.promptEvent) return;
+  pwaState.promptEvent.prompt();
+  await pwaState.promptEvent.userChoice;
+  pwaState.promptEvent = null;
+}
+
+/* ================= écran de connexion ================= */
+// Un compte = un espace isolé. Pas de récupération de mot de passe (aucune
+// infrastructure d'envoi d'email ici) — volontairement minimal, cohérent
+// avec un usage personnel/auto-hébergé. Utilise aiPost (pas apiPost) : un
+// mauvais mot de passe renvoie aussi un 401, et son message doit rester
+// lisible tel quel, pas remplacé par le traitement générique de session
+// expirée des trois autres helpers (voir plus bas).
+
+const AuthScreen = {
+  setup() {
+    const mode = ref("login"); // "login" | "register"
+    const email = ref("");
+    const password = ref("");
+    const error = ref("");
+    const loading = ref(false);
+
+    async function submit() {
+      if (!email.value.trim() || !password.value) return;
+      error.value = "";
+      loading.value = true;
+      try {
+        const path = mode.value === "login" ? "/auth/login" : "/auth/register";
+        const data = await aiPost(path, { email: email.value.trim(), password: password.value });
+        authState.account = data;
+        authState.checked = true;
+      } catch (e) {
+        error.value = e.message;
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    return { mode, email, password, error, loading, submit };
+  },
+  template: `
+    <div class="app-shell" style="align-items:center; justify-content:center;">
+      <div class="ledger-card" style="max-width:360px; width:100%;">
+        <h2>{{ mode === 'login' ? 'Connexion' : 'Créer un compte' }}</h2>
+        <p class="folio-sub" style="margin-top:-6px">
+          {{ mode === 'login' ? 'Retrouve ton espace personnel.' : 'Un compte = un espace totalement isolé, rien que pour toi.' }}
+        </p>
+        <div class="field">
+          <label>Email</label>
+          <input type="email" v-model="email" @keyup.enter="submit" autocomplete="username">
+        </div>
+        <div class="field">
+          <label>Mot de passe</label>
+          <input type="password" v-model="password" @keyup.enter="submit"
+            :autocomplete="mode === 'login' ? 'current-password' : 'new-password'">
+        </div>
+        <p v-if="error" class="api-banner" style="margin-bottom:14px">{{ error }}</p>
+        <div class="action-row">
+          <button class="btn-ink" :disabled="loading" @click="submit">
+            {{ loading ? "…" : (mode === 'login' ? 'Se connecter' : "S'inscrire") }}
+          </button>
+          <button class="btn-quiet" @click="mode = mode === 'login' ? 'register' : 'login'; error = ''">
+            {{ mode === 'login' ? 'Créer un compte' : "J'ai déjà un compte" }}
+          </button>
+        </div>
+      </div>
+    </div>
+  `
+};
+
 /* ================= client API ================= */
 // Petit wrapper autour de fetch : lève une erreur lisible si la requête
 // échoue, pour que chaque composant puisse l'afficher dans la bannière.
+// Sur un 401 (session absente/expirée), les trois helpers ci-dessous basculent
+// directement vers l'écran de connexion plutôt que d'afficher la bannière
+// générique "serveur injoignable" — voir le composant App.
 
 const apiState = reactive({ error: null });
+
+function authExpired() {
+  authState.account = null;
+  authState.checked = true;
+  const err = new Error("Non authentifié.");
+  err.isAuthError = true;
+  return err;
+}
 
 async function apiGet(path) {
   try {
     const res = await fetch("/api" + path);
+    if (res.status === 401) throw authExpired();
     if (!res.ok) throw new Error("Réponse " + res.status);
     apiState.error = null;
     return await res.json();
   } catch (e) {
-    apiState.error = "Impossible de contacter le serveur (" + path + "). Vérifie que le serveur Express tourne.";
+    if (!e.isAuthError) {
+      apiState.error = "Impossible de contacter le serveur (" + path + "). Vérifie que le serveur Express tourne.";
+    }
     throw e;
   }
 }
@@ -170,35 +292,51 @@ async function apiPost(path, body) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
+    if (res.status === 401) throw authExpired();
     if (!res.ok) throw new Error("Réponse " + res.status);
     apiState.error = null;
     return await res.json();
   } catch (e) {
-    apiState.error = "Échec de l'enregistrement (" + path + "). Réessaie dans un instant.";
+    if (!e.isAuthError) {
+      apiState.error = "Échec de l'enregistrement (" + path + "). Réessaie dans un instant.";
+    }
     throw e;
   }
 }
 async function apiDelete(path) {
   try {
     const res = await fetch("/api" + path, { method: "DELETE" });
+    if (res.status === 401) throw authExpired();
     if (!res.ok) throw new Error("Réponse " + res.status);
     apiState.error = null;
     return await res.json();
   } catch (e) {
-    apiState.error = "Échec de la suppression (" + path + "). Réessaie dans un instant.";
+    if (!e.isAuthError) {
+      apiState.error = "Échec de la suppression (" + path + "). Réessaie dans un instant.";
+    }
     throw e;
   }
 }
 
-// Appels aux routes IA : contrairement à apiPost, l'erreur n'alimente pas la
-// bannière globale — elle est renvoyée telle quelle (message du serveur,
-// ex. "clé manquante") pour être affichée juste à côté du bouton IA concerné.
+// Appels aux routes IA — et à /auth/login /auth/register (mêmes besoins :
+// message d'erreur du serveur affiché tel quel à côté du formulaire, jamais
+// dans la bannière globale). Contrairement aux trois helpers ci-dessus, un
+// 401 ici n'est PAS forcément "session expirée" : un mauvais mot de passe
+// sur /auth/login est aussi un 401, et son message doit rester lisible, pas
+// remplacé par un message générique. Le seul cas où le 401 doit quand même
+// faire basculer vers l'écran de connexion est une VRAIE expiration de
+// session sur un appel IA protégé (ex. génération de quiz) — jamais sur les
+// routes d'auth elles-mêmes.
 async function aiPost(path, body) {
   const res = await fetch("/api" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {})
   });
+  if (res.status === 401 && !path.startsWith("/auth/")) {
+    authState.account = null;
+    authState.checked = true;
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Erreur IA.");
   return data;
@@ -355,7 +493,7 @@ const AujourdhuiTab = {
     return {
       due, upcoming, loading, passThreshold, quizzes, answersMap, resultsMap,
       missingAnswerMap, submittingMap, generatingQuizFor, quizGenError, moduleProgress, markStudied,
-      generateQuizFor, submitQuiz, retryQuiz, resultFor, optionStyle, moduleStyle
+      generateQuizFor, submitQuiz, retryQuiz, resultFor, optionStyle, moduleStyle, resourceBadge
     };
   },
   template: `
@@ -395,6 +533,15 @@ const AujourdhuiTab = {
           </div>
 
           <p v-if="c.description" class="today-lesson-desc">{{ c.description }}</p>
+
+          <div v-if="c.resources && c.resources.length" class="resource-list">
+            <p class="resource-list-title">Pour approfondir</p>
+            <div v-for="r in c.resources" :key="r.name" class="resource-chip">
+              <span class="resource-chip-badge" :class="resourceBadge(r.type).cls">{{ resourceBadge(r.type).label }}</span>
+              <span class="resource-chip-name">{{ r.name }}</span>
+              <span class="resource-chip-note">{{ r.note }}</span>
+            </div>
+          </div>
 
           <div v-if="c.status === 'Pas commencé'" class="today-lesson-action">
             <p class="today-lesson-hint">Étudie ce cours, puis reviens valider ici.</p>
@@ -607,14 +754,16 @@ const ProgrammeTab = {
     onMounted(async () => { await load(); await nextTick(); initDragAndDrop(); });
 
     // ---- nouvel objectif : un simple message libre. L'IA découpe en
-    // chapitres ET choisit elle-même les jours/durée par défaut ; elle ne
-    // devine jamais l'heure sans indice dans le message — dans ce cas on la
-    // demande ensuite (pendingTime), sans relancer l'IA une seconde fois.
+    // chapitres et choisit elle-même la durée par défaut ; elle ne devine
+    // jamais les jours ou l'heure sans indice dans le message — dans ce cas
+    // on les demande ensuite (pendingTime), sans relancer l'IA une seconde
+    // fois pour la même génération.
     const showManualAdd = ref(false);
     const objectiveMessage = ref("");
     const objectiveLoading = ref(false);
     const objectiveError = ref(null);
-    const pendingTime = ref(null); // { module, chapters, days, duration_minutes, chosenTime }
+    // { module, chapters, duration_minutes, needsDays, needsTime, chosenDays, chosenTime }
+    const pendingTime = ref(null);
     // Historique affiché comme une conversation avec l'assistant : chaque
     // objectif soumis devient un échange (message envoyé + réponse de l'IA),
     // pour que la logique "je dis mon objectif → il construit le programme"
@@ -625,7 +774,8 @@ const ProgrammeTab = {
       createdChapters.forEach((c, i) => {
         chapters.value.push({
           id: c.id, module, label: c.label, description: c.description,
-          month_label: c.date_label, status: "Pas commencé", sort_order: chapters.value.length + i
+          month_label: c.date_label, status: "Pas commencé", sort_order: chapters.value.length + i,
+          resources: c.resources || []
         });
       });
       if (!moduleOrder.value.includes(module)) moduleOrder.value.push(module);
@@ -639,12 +789,15 @@ const ProgrammeTab = {
       objectiveError.value = null;
       try {
         const res = await aiPost("/objectives/generate", { message: title });
-        if (res.needs_time) {
+        if (res.needs_schedule) {
           pendingTime.value = {
-            module: res.module, chapters: res.chapters, days: res.days,
-            duration_minutes: res.duration_minutes, chosenTime: "19:00"
+            module: res.module, chapters: res.chapters, duration_minutes: res.duration_minutes,
+            needsDays: !res.days, needsTime: !res.start_time,
+            chosenDays: res.days || [], chosenTime: res.start_time || "19:00"
           };
-          chatLog.value.push({ title, askTime: true });
+          chatLog.value.push({
+            title, askSchedule: true, needsDays: !res.days, needsTime: !res.start_time
+          });
         } else {
           applyCreatedObjective(res.module, res.chapters);
           chatLog.value.push({
@@ -664,20 +817,20 @@ const ProgrammeTab = {
 
     async function confirmPendingTime() {
       const draft = pendingTime.value;
-      if (!draft) return;
+      if (!draft || !draft.chosenDays.length) return;
       objectiveLoading.value = true;
       objectiveError.value = null;
       try {
         const res = await apiPost("/objectives/finalize", {
-          module: draft.module, chapters: draft.chapters, days: draft.days,
+          module: draft.module, chapters: draft.chapters, days: draft.chosenDays,
           start_time: draft.chosenTime, duration_minutes: draft.duration_minutes
         });
         applyCreatedObjective(res.module, res.chapters);
         chatLog.value.push({
-          title: draft.chosenTime, isTimeReply: true,
+          title: draft.chosenDays.join(', ') + ' à ' + draft.chosenTime, isTimeReply: true,
           module: res.module, count: res.chapters.length,
           firstDate: res.chapters[0] ? res.chapters[0].date_label : "",
-          days: draft.days, start_time: draft.chosenTime, duration_minutes: draft.duration_minutes
+          days: draft.chosenDays, start_time: draft.chosenTime, duration_minutes: draft.duration_minutes
         });
       } catch (e) {
         objectiveError.value = e.message;
@@ -706,7 +859,8 @@ const ProgrammeTab = {
       newChapter, saveChapterText, moveChapterModule, addChapter, removeChapter, columnEls,
       CHAPTER_STYLE, generatingQuizFor, quizGenError, quizGenDone, generateQuizForChapter,
       showManualAdd, objectiveMessage, objectiveLoading, objectiveError, generateObjective,
-      pendingTime, confirmPendingTime, chatLog, objectivesPanel, moduleStyle, removeObjective
+      pendingTime, confirmPendingTime, chatLog, objectivesPanel, moduleStyle, removeObjective,
+      resourceBadge, DAYS
     };
   },
   template: `
@@ -756,6 +910,12 @@ const ProgrammeTab = {
                     <div class="kanban-card-body">
                       <textarea class="kanban-card-title" rows="1" v-auto-grow v-model="c.label" @change="saveChapterText(c)"></textarea>
                       <p v-if="c.description" class="kanban-card-desc">{{ c.description }}</p>
+                      <div v-if="c.resources && c.resources.length" class="resource-list resource-list-compact">
+                        <div v-for="r in c.resources" :key="r.name" class="resource-chip">
+                          <span class="resource-chip-badge" :class="resourceBadge(r.type).cls">{{ resourceBadge(r.type).label }}</span>
+                          <span class="resource-chip-name">{{ r.name }}</span>
+                        </div>
+                      </div>
                       <div class="kanban-card-meta">
                         <input type="text" class="kanban-card-input" v-model="c.month_label" @change="saveChapterText(c)" placeholder="Période">
                         <select class="kanban-card-select" :value="c.module" @change="moveChapterModule(c, $event.target.value)">
@@ -806,14 +966,16 @@ const ProgrammeTab = {
             <div class="chat-bubble chat-bubble-assistant">
               Décris un objectif — comptabilité, anglais, un projet à développer, un concours administratif,
               n'importe quel domaine. Précise tes disponibilités si tu en as (jours, heure, durée) ; sinon
-              je choisis un rythme raisonnable moi-même, et je ne te demande l'heure que si je n'ai vraiment
-              aucun indice. Tu peux aussi me donner un programme, référentiel ou cours précis à suivre
-              (ex. « le programme du DCG UE9 », « le plan du livre X ») — je structure les chapitres dessus.
+              je choisis moi-même une durée raisonnable, et je ne te demande les jours et/ou l'heure que si
+              je n'ai vraiment aucun indice. Tu peux aussi me donner un programme, référentiel ou cours précis
+              à suivre (ex. « le programme du DCG UE9 », « le plan du livre X ») — je structure les chapitres dessus.
             </div>
             <template v-for="(m,i) in chatLog" :key="i">
               <div class="chat-bubble chat-bubble-user">{{ m.title }}</div>
-              <div v-if="m.askTime" class="chat-bubble chat-bubble-assistant">
-                À quelle heure veux-tu recevoir ces sessions ?
+              <div v-if="m.askSchedule" class="chat-bubble chat-bubble-assistant">
+                <template v-if="m.needsDays && m.needsTime">Quels jours et à quelle heure veux-tu recevoir ces sessions ?</template>
+                <template v-else-if="m.needsDays">Quels jours veux-tu recevoir ces sessions ?</template>
+                <template v-else>À quelle heure veux-tu recevoir ces sessions ?</template>
               </div>
               <div v-else class="chat-bubble chat-bubble-assistant" :class="{'chat-bubble-error': m.error}">
                 <template v-if="m.error">{{ m.error }}</template>
@@ -826,8 +988,13 @@ const ProgrammeTab = {
             </template>
 
             <div v-if="pendingTime" class="chat-time-reply">
-              <input type="time" v-model="pendingTime.chosenTime">
-              <button class="btn-quiet" :disabled="objectiveLoading" @click="confirmPendingTime">
+              <div v-if="pendingTime.needsDays" class="day-picker">
+                <label v-for="d in DAYS" :key="d" class="day-picker-option" :class="{active: pendingTime.chosenDays.includes(d)}">
+                  <input type="checkbox" :value="d" v-model="pendingTime.chosenDays">{{ d.slice(0,3) }}
+                </label>
+              </div>
+              <input v-if="pendingTime.needsTime" type="time" v-model="pendingTime.chosenTime">
+              <button class="btn-quiet" :disabled="objectiveLoading || !pendingTime.chosenDays.length" @click="confirmPendingTime">
                 {{ objectiveLoading ? "…" : "Confirmer" }}
               </button>
             </div>
@@ -1057,7 +1224,7 @@ const BilanTab = {
 /* ================= composant racine ================= */
 
 const App = {
-  components: { AujourdhuiTab, ProgrammeTab, BilanTab, ConfirmDialog },
+  components: { AujourdhuiTab, ProgrammeTab, BilanTab, ConfirmDialog, AuthScreen },
   setup() {
     const activeTab = ref("jour");
     const tabs = [
@@ -1076,61 +1243,95 @@ const App = {
     function selectTab(id) { activeTab.value = id; menuOpen.value = false; }
     watch(menuOpen, (open) => { document.body.style.overflow = open ? "hidden" : ""; });
 
-    return { activeTab, tabs, apiState, resetConfirming, reset, menuOpen, selectTab };
+    // Vérifie une seule fois, au montage, si une session valide existe déjà
+    // (cookie envoyé automatiquement par le navigateur, même origine).
+    onMounted(async () => {
+      try { authState.account = await apiGet("/auth/me"); } catch (e) { /* pas connecté */ }
+      authState.checked = true;
+    });
+    async function logout() {
+      await apiPost("/auth/logout");
+      authState.account = null;
+    }
+
+    return {
+      activeTab, tabs, apiState, resetConfirming, reset, menuOpen, selectTab,
+      authState, logout, pwaState, installApp
+    };
   },
   template: `
-    <div class="app-shell">
-      <button class="menu-toggle" @click="menuOpen = true" aria-label="Ouvrir le menu">
-        <svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-      </button>
-      <div class="sidebar-backdrop" v-if="menuOpen" @click="menuOpen = false"></div>
+    <template v-if="authState.checked">
+      <div v-if="authState.account" class="app-shell">
+        <button class="menu-toggle" @click="menuOpen = true" aria-label="Ouvrir le menu">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+        <div class="sidebar-backdrop" v-if="menuOpen" @click="menuOpen = false"></div>
 
-      <aside class="sidebar" :class="{open: menuOpen}">
-        <div class="sidebar-brand">
-          <div class="masthead-mark" aria-hidden="true">
-            <svg viewBox="0 0 100 100" width="30" height="30">
-              <rect width="100" height="100" rx="22" fill="var(--brand)"/>
-              <line x1="24" y1="34" x2="76" y2="34" stroke="white" stroke-width="6" stroke-linecap="round"/>
-              <line x1="24" y1="50" x2="76" y2="50" stroke="white" stroke-width="6" stroke-linecap="round"/>
-              <line x1="24" y1="66" x2="58" y2="66" stroke="white" stroke-width="6" stroke-linecap="round"/>
-            </svg>
+        <aside class="sidebar" :class="{open: menuOpen}">
+          <div class="sidebar-brand">
+            <div class="masthead-mark" aria-hidden="true">
+              <svg viewBox="0 0 100 100" width="30" height="30">
+                <rect width="100" height="100" rx="22" fill="var(--brand)"/>
+                <line x1="24" y1="34" x2="76" y2="34" stroke="white" stroke-width="6" stroke-linecap="round"/>
+                <line x1="24" y1="50" x2="76" y2="50" stroke="white" stroke-width="6" stroke-linecap="round"/>
+                <line x1="24" y1="66" x2="58" y2="66" stroke="white" stroke-width="6" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <div>
+              <h1>Grand livre</h1>
+              <p class="masthead-sub">{{ authState.account.email }}</p>
+            </div>
+            <button class="sidebar-close" @click="menuOpen = false" aria-label="Fermer le menu">✕</button>
           </div>
-          <div>
-            <h1>Grand livre</h1>
-            <p class="masthead-sub">Finance × Tech</p>
+
+          <nav class="sidebar-nav" role="tablist">
+            <button v-for="t in tabs" :key="t.id" class="side-link" :class="{active: activeTab === t.id}"
+              role="tab" :aria-selected="activeTab === t.id" @click="selectTab(t.id)">
+              <span class="tab-icon" v-html="t.icon"></span><span>{{ t.label }}</span>
+            </button>
+          </nav>
+
+          <div class="sidebar-bottom">
+            <button v-if="pwaState.promptEvent" class="install-btn" @click="installApp">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/>
+              </svg>
+              Installer l'application
+            </button>
+            <button class="side-link" @click="logout">
+              <span class="tab-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>
+                </svg>
+              </span>
+              <span>Déconnexion</span>
+            </button>
           </div>
-          <button class="sidebar-close" @click="menuOpen = false" aria-label="Fermer le menu">✕</button>
+        </aside>
+
+        <div class="main-col">
+          <div v-if="apiState.error" class="api-banner">
+            {{ apiState.error }}
+          </div>
+
+          <main>
+            <AujourdhuiTab v-if="activeTab === 'jour'" />
+            <ProgrammeTab v-else-if="activeTab === 'programme'" />
+            <BilanTab v-else-if="activeTab === 'bilan'" />
+          </main>
+
+          <footer class="foot">
+            <span>Données en SQLite.</span>
+            <button class="btn-quiet" @click="reset">
+              {{ resetConfirming ? "Confirmer l'effacement" : "Réinitialiser" }}
+            </button>
+          </footer>
         </div>
 
-        <nav class="sidebar-nav" role="tablist">
-          <button v-for="t in tabs" :key="t.id" class="side-link" :class="{active: activeTab === t.id}"
-            role="tab" :aria-selected="activeTab === t.id" @click="selectTab(t.id)">
-            <span class="tab-icon" v-html="t.icon"></span><span>{{ t.label }}</span>
-          </button>
-        </nav>
-      </aside>
-
-      <div class="main-col">
-        <div v-if="apiState.error" class="api-banner">
-          {{ apiState.error }}
-        </div>
-
-        <main>
-          <AujourdhuiTab v-if="activeTab === 'jour'" />
-          <ProgrammeTab v-else-if="activeTab === 'programme'" />
-          <BilanTab v-else-if="activeTab === 'bilan'" />
-        </main>
-
-        <footer class="foot">
-          <span>Parcours sept. 2026 → déc. 2027 · données en SQLite.</span>
-          <button class="btn-quiet" @click="reset">
-            {{ resetConfirming ? "Confirmer l'effacement" : "Réinitialiser" }}
-          </button>
-        </footer>
+        <ConfirmDialog />
       </div>
-
-      <ConfirmDialog />
-    </div>
+      <AuthScreen v-else />
+    </template>
   `
 };
 
