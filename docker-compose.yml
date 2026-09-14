@@ -1,0 +1,18 @@
+services:
+  grand-livre:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - grand-livre-data:/app/data
+    # Optionnel — active les fonctionnalités IA (quiz générés, avis, suggestions).
+    # Renseigne ces valeurs directement ici, ou via un fichier .env à côté de ce
+    # docker-compose.yml (Compose le charge automatiquement, et il n'est jamais
+    # copié dans l'image — voir .dockerignore). Sans clé, l'app tourne normalement.
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-sonnet-4.5}
+    restart: unless-stopped
+
+volumes:
+  grand-livre-data:
