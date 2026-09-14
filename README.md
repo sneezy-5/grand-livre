@@ -159,16 +159,17 @@ l'image, aucune installation à faire sur la machine cible à part Docker lui-m�
 docker compose up -d --build
 ```
 
-Puis ouvrir `http://localhost:3000`. C'est tout — `docker-compose.yml` construit l'image,
-publie le port 3000 et monte un volume nommé (`grand-livre-data`) sur `/app/data`, où vit
-`data.sqlite`. Ce volume survit aux redémarrages et aux rebuilds de l'image (`docker compose
-up -d --build` après avoir modifié le code ne touche pas aux données).
+Puis ouvrir `http://localhost:3003`. C'est tout — `docker-compose.yml` construit l'image,
+publie le port 3003 sur l'hôte (le conteneur écoute en interne sur 3000 ; le mapping évite un
+conflit avec un autre service déjà sur 3000) et monte un volume nommé (`grand-livre-data`) sur
+`/app/data`, où vit `data.sqlite`. Ce volume survit aux redémarrages et aux rebuilds de l'image
+(`docker compose up -d --build` après avoir modifié le code ne touche pas aux données).
 
 Sans Compose, l'équivalent est :
 
 ```bash
 docker build -t grand-livre .
-docker run -d -p 3000:3000 -v grand-livre-data:/app/data --name grand-livre grand-livre
+docker run -d -p 3003:3000 -v grand-livre-data:/app/data --name grand-livre grand-livre
 ```
 
 Pour activer les [fonctionnalités IA](#fonctionnalités-ia-optionnel) dans le conteneur, ajoute
@@ -181,7 +182,7 @@ Détails utiles :
   n'est disponible pour la plateforme cible, la seconde ne garde que le strict runtime —
   l'image finale n'a pas de compilateur.
 - Le port s'ajuste via la variable d'environnement `PORT` (par défaut `3000` dans l'image) ;
-  dans `docker-compose.yml`, change `"3000:3000"` en `"8080:3000"` par exemple pour exposer
+  dans `docker-compose.yml`, change `"3003:3000"` en `"8080:3000"` par exemple pour exposer
   un autre port sur l'hôte sans toucher au conteneur.
 - **Sauvegarder les données** : `docker run --rm -v grand-livre-data:/data -v "$PWD":/backup
   debian tar czf /backup/grand-livre-backup.tar.gz -C /data .` archive le volume dans le

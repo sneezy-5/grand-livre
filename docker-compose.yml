@@ -2,7 +2,7 @@ services:
   grand-livre:
     build: .
     ports:
-      - "3000:3000"
+      - "3003:3000"
     volumes:
       - grand-livre-data:/app/data
     # Optionnel — active les fonctionnalités IA (quiz générés, avis, suggestions).
