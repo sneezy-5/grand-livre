@@ -342,6 +342,9 @@ main{max-width:1180px;}
   padding:3px 6px;
   width:82px;
 }
+.kanban-card-input[type=date]{width:122px;}
+.kanban-card-input[type=time]{width:76px;}
+.kanban-card-input:disabled{opacity:.4;}
 @media (max-width:720px){ .kanban-board{grid-template-columns:1fr;} }
 
 /* ---------- folio / cards ---------- */

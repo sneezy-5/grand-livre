@@ -129,11 +129,13 @@ function dateOfSlot(slot) {
 const CHAPTER_PASS_THRESHOLD = 70;
 
 // Répartit `count` sessions sur les prochaines occurrences des jours fournis
-// (noms français, ex. ["Lundi","Mercredi"]), à partir d'aujourd'hui.
-function scheduleDates(availableDayNames, count) {
+// (noms français, ex. ["Lundi","Mercredi"]), à partir de `startFrom` (une
+// date précise demandée par l'apprenant(e), ex. "à partir du 20 octobre")
+// ou d'aujourd'hui par défaut si rien n'a été précisé.
+function scheduleDates(availableDayNames, count, startFrom) {
   const wanted = new Set(availableDayNames.map((n) => DAY_NAMES.indexOf(n)).filter((i) => i >= 0));
   const dates = [];
-  const cursor = new Date();
+  const cursor = startFrom ? new Date(startFrom) : new Date();
   cursor.setHours(0, 0, 0, 0);
   while (dates.length < count) {
     if (wanted.has(cursor.getDay())) dates.push(new Date(cursor));
@@ -381,12 +383,67 @@ app.post("/api/milestones-reorder", (req, res) => {
 // les quiz. Chaque chapitre appartient à un module (texte libre, pas une
 // table séparée) — le regroupement par module se fait côté client.
 
+// Le créneau le plus récent de chaque chapitre est joint ici pour exposer sa
+// date/heure réelle (scheduled_date/scheduled_time) — c'est ce que l'UI
+// permet de modifier via /api/programme/:id/reschedule, plutôt que de
+// laisser `month_label` être un simple texte libre déconnecté du vrai
+// planning utilisé par /api/today.
 app.get("/api/programme", (req, res) => {
-  const rows = req.db.prepare("SELECT * FROM programme_chapters ORDER BY sort_order ASC").all();
+  const rows = req.db
+    .prepare(
+      `SELECT c.*, s.week_start, s.day, s.start_time AS slot_time
+       FROM programme_chapters c
+       LEFT JOIN schedule_slots s ON s.id = (
+         SELECT id FROM schedule_slots WHERE chapter_id = c.id ORDER BY id DESC LIMIT 1
+       )
+       ORDER BY c.sort_order ASC`
+    )
+    .all();
   res.json(rows.map((r) => {
-    const { resources_json, ...rest } = r;
-    return { ...rest, resources: JSON.parse(resources_json || "[]") };
+    const { resources_json, week_start, day, slot_time, ...rest } = r;
+    const scheduled_date = week_start && day ? isoDate(dateOfSlot({ week_start, day })) : null;
+    return {
+      ...rest, resources: JSON.parse(resources_json || "[]"),
+      scheduled_date, scheduled_time: scheduled_date ? slot_time : null
+    };
   }));
+});
+
+// Change la date/heure planifiée d'un chapitre. Crée un créneau si le
+// chapitre n'en avait pas encore (ex. chapitre ajouté manuellement), sinon
+// met à jour le plus récent. Corps : { date: "AAAA-MM-JJ", start_time }
+app.post("/api/programme/:id/reschedule", (req, res) => {
+  const { date, start_time } = req.body;
+  if (!date) return res.status(400).json({ error: "date est obligatoire." });
+  const chapter = req.db.prepare("SELECT id FROM programme_chapters WHERE id = ?").get(req.params.id);
+  if (!chapter) return res.status(404).json({ error: "Chapitre introuvable." });
+
+  const d = new Date(date + "T00:00:00");
+  if (isNaN(d.getTime())) return res.status(400).json({ error: "Date invalide." });
+  const weekStart = isoDate(mondayOf(d));
+  const day = DAY_NAMES[d.getDay()];
+  const time = start_time || "19:00";
+
+  const existingSlot = req.db
+    .prepare("SELECT id FROM schedule_slots WHERE chapter_id = ? ORDER BY id DESC LIMIT 1")
+    .get(req.params.id);
+
+  if (existingSlot) {
+    req.db.prepare("UPDATE schedule_slots SET week_start = ?, day = ?, start_time = ? WHERE id = ?")
+      .run(weekStart, day, time, existingSlot.id);
+  } else {
+    const maxOrder = req.db
+      .prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM schedule_slots WHERE week_start = ? AND day = ?")
+      .get(weekStart, day).m;
+    req.db.prepare(
+      `INSERT INTO schedule_slots (week_start, day, start_time, duration_minutes, chapter_id, done, sort_order)
+       VALUES (?, ?, ?, 60, ?, 0, ?)`
+    ).run(weekStart, day, time, req.params.id, maxOrder + 1);
+  }
+
+  const dateLabel = formatDateLabel(d);
+  req.db.prepare("UPDATE programme_chapters SET month_label = ? WHERE id = ?").run(dateLabel, req.params.id);
+  res.json({ ok: true, scheduled_date: date, scheduled_time: time, date_label: dateLabel });
 });
 
 // Ajoute un chapitre. Corps : { module, label, description, month_label }
@@ -502,8 +559,9 @@ app.post("/api/programme/:id/generate-quiz", async (req, res) => {
 // de l'heure) pour ne pas dupliquer la logique de planification. Reçoit `db`
 // en paramètre explicite (l'espace du compte courant) plutôt que de capturer
 // une base globale.
-function persistObjective(db, module, chapters, days, start_time, duration_minutes) {
-  const dates = scheduleDates(days, chapters.length);
+function persistObjective(db, module, chapters, days, start_time, duration_minutes, start_date) {
+  const startFrom = start_date ? new Date(start_date + "T00:00:00") : undefined;
+  const dates = scheduleDates(days, chapters.length, startFrom);
 
   const insertChapter = db.prepare(
     `INSERT INTO programme_chapters (module, label, description, month_label, status, sort_order, resources_json)
@@ -535,7 +593,8 @@ function persistObjective(db, module, chapters, days, start_time, duration_minut
 
       return {
         id: chapterId, label: c.label, description: c.description,
-        date_label: formatDateLabel(date), day, resources: c.resources || []
+        date_label: formatDateLabel(date), day, resources: c.resources || [],
+        scheduled_date: isoDate(date), scheduled_time: start_time
       };
     });
   });
@@ -559,16 +618,16 @@ app.post("/api/objectives/generate", async (req, res) => {
   }
   try {
     const plan = await ai.generateObjectivePlan(message.trim());
-    const { days, duration_minutes, start_time } = plan.schedule;
+    const { days, duration_minutes, start_time, start_date } = plan.schedule;
 
     if (!days || !start_time) {
       return res.status(200).json({
         needs_schedule: true, module: plan.module, chapters: plan.chapters,
-        days: days || null, duration_minutes, start_time: start_time || null
+        days: days || null, duration_minutes, start_time: start_time || null, start_date: start_date || null
       });
     }
 
-    const chapters = persistObjective(req.db, plan.module, plan.chapters, days, start_time, duration_minutes);
+    const chapters = persistObjective(req.db, plan.module, plan.chapters, days, start_time, duration_minutes, start_date);
     res.status(201).json({ module: plan.module, chapters, days, start_time, duration_minutes });
   } catch (e) {
     res.status(e.statusCode || 502).json({ error: e.message });
@@ -578,13 +637,13 @@ app.post("/api/objectives/generate", async (req, res) => {
 // Termine la création d'un objectif dont l'heure manquait : reprend le plan
 // déjà généré (chapitres + jours/durée déjà décidés) tel que renvoyé par
 // /api/objectives/generate, avec l'heure fournie ensuite par la personne.
-// Corps : { module, chapters: [{label, description}], days, start_time, duration_minutes }
+// Corps : { module, chapters: [{label, description}], days, start_time, duration_minutes, start_date }
 app.post("/api/objectives/finalize", (req, res) => {
-  const { module, chapters, days, start_time, duration_minutes } = req.body;
+  const { module, chapters, days, start_time, duration_minutes, start_date } = req.body;
   if (!module || !Array.isArray(chapters) || !chapters.length || !Array.isArray(days) || !days.length || !start_time) {
     return res.status(400).json({ error: "module, chapters, days et start_time sont obligatoires." });
   }
-  const created = persistObjective(req.db, module, chapters, days, start_time, duration_minutes);
+  const created = persistObjective(req.db, module, chapters, days, start_time, duration_minutes, start_date);
   res.status(201).json({ module, chapters: created });
 });
 

@@ -189,6 +189,8 @@ générique du type "continue comme ça". Pas de formule d'ouverture ni de signa
 
 const VALID_DAY_NAMES = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
 
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 function validateObjectivePlanShape(data) {
   const daysValid =
     data.schedule &&
@@ -196,6 +198,13 @@ function validateObjectivePlanShape(data) {
       (Array.isArray(data.schedule.days) &&
         data.schedule.days.length &&
         data.schedule.days.every((d) => VALID_DAY_NAMES.includes(d))));
+  const startDateValid =
+    !data.schedule ||
+    data.schedule.start_date === undefined ||
+    data.schedule.start_date === null ||
+    (typeof data.schedule.start_date === "string" &&
+      ISO_DATE_RE.test(data.schedule.start_date) &&
+      !isNaN(new Date(data.schedule.start_date + "T00:00:00").getTime()));
   if (
     !data ||
     typeof data.module !== "string" ||
@@ -203,6 +212,7 @@ function validateObjectivePlanShape(data) {
     data.chapters.length < 2 ||
     !data.schedule ||
     !daysValid ||
+    !startDateValid ||
     typeof data.schedule.duration_minutes !== "number" ||
     (data.schedule.start_time !== null && typeof data.schedule.start_time !== "string")
   ) {
@@ -234,10 +244,15 @@ function validateObjectivePlanShape(data) {
 // serveur (server.js) — l'IA ne fait que le découpage pédagogique et lire
 // les préférences de l'apprenant(e), pas le calendrier lui-même.
 async function generateObjectivePlan(message) {
+  const today = new Date();
+  const todayLabel = today.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  const todayIso = today.toISOString().slice(0, 10);
   const prompt = `Tu es un pédagogue expert, capable de concevoir un parcours d'apprentissage
 structuré dans absolument n'importe quel domaine — comptabilité, langue étrangère, développement
 logiciel, préparation à un concours administratif, gestion de projet, etc. Adapte entièrement ton
 expertise et ton vocabulaire au domaine de l'objectif ci-dessous, quel qu'il soit.
+
+Nous sommes aujourd'hui le ${todayLabel} (${todayIso}).
 
 Message de l'apprenant(e), décrivant son objectif (et parfois ses disponibilités) :
 "${message}"
@@ -282,6 +297,15 @@ plutôt que d'inventer un nom qui n'existe pas.
   "à midi" → "12:30", "après le travail" → "19:00", "19h" → "19:00"). Si le message ne dit
   vraiment rien sur le moment de la journée, mets "start_time" à null plutôt que d'inventer une
   heure — ce point sera alors demandé séparément à l'apprenant(e).
+- "start_date" : la date à laquelle démarrer le tout premier chapitre, au format "AAAA-MM-JJ".
+  Déduis-la UNIQUEMENT si le message donne une date ou un délai concret et calculable à partir
+  d'aujourd'hui (${todayIso}) — ex. "à partir du 20 octobre" → "2026-10-20", "dans deux semaines" →
+  calcule la date exacte, "commence le mois prochain" → le 1er du mois suivant. Si le message dit
+  juste "commence après mon autre programme" ou une condition dont tu ne peux pas calculer la date
+  toi-même (tu n'as pas accès aux autres programmes de l'apprenant(e)), mets "start_date" à null —
+  ne devine JAMAIS une date approximative dans ce cas, la personne devra la préciser elle-même. Si
+  le message ne mentionne aucune contrainte de démarrage, mets aussi "start_date" à null : le
+  programme démarre alors dès aujourd'hui, ce qui est le comportement par défaut souhaité.
 
 Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, exactement dans cette forme :
 {
@@ -299,6 +323,7 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, exactement dan
   "schedule": {
     "days": ["Lundi", "Mercredi", "Vendredi"],
     "duration_minutes": 45,
+    "start_date": null,
     "start_time": "19:00"
   }
 }`;

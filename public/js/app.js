@@ -662,6 +662,17 @@ const ProgrammeTab = {
     async function saveChapterText(c) {
       await apiPost("/programme/" + c.id, { label: c.label, month_label: c.month_label });
     }
+    // Déplace réellement la session du chapitre (crée son créneau au besoin)
+    // — contrairement à l'ancien champ "Période" en texte libre, ceci met à
+    // jour la vraie date utilisée par /api/today pour trier ce qui est dû.
+    async function rescheduleChapter(c) {
+      if (!c.scheduled_date) return;
+      const res = await apiPost("/programme/" + c.id + "/reschedule", {
+        date: c.scheduled_date, start_time: c.scheduled_time || "19:00"
+      });
+      c.scheduled_time = res.scheduled_time;
+      c.month_label = res.date_label;
+    }
     async function moveChapterModule(c, newModule) {
       c.module = newModule;
       await apiPost("/programme/" + c.id, { module: newModule });
@@ -676,7 +687,8 @@ const ProgrammeTab = {
       chapters.value.push({
         id: created.id, module: moduleName, label: newChapter.label.trim(),
         description: newChapter.description.trim(), month_label: newChapter.month_label.trim(),
-        status: "Pas commencé", sort_order: chapters.value.length
+        status: "Pas commencé", sort_order: chapters.value.length,
+        resources: [], scheduled_date: null, scheduled_time: null
       });
       if (!moduleOrder.value.includes(moduleName)) moduleOrder.value.push(moduleName);
       selectedModule.value = moduleName;
@@ -775,7 +787,7 @@ const ProgrammeTab = {
         chapters.value.push({
           id: c.id, module, label: c.label, description: c.description,
           month_label: c.date_label, status: "Pas commencé", sort_order: chapters.value.length + i,
-          resources: c.resources || []
+          resources: c.resources || [], scheduled_date: c.scheduled_date || null, scheduled_time: c.scheduled_time || null
         });
       });
       if (!moduleOrder.value.includes(module)) moduleOrder.value.push(module);
@@ -792,6 +804,7 @@ const ProgrammeTab = {
         if (res.needs_schedule) {
           pendingTime.value = {
             module: res.module, chapters: res.chapters, duration_minutes: res.duration_minutes,
+            start_date: res.start_date,
             needsDays: !res.days, needsTime: !res.start_time,
             chosenDays: res.days || [], chosenTime: res.start_time || "19:00"
           };
@@ -823,7 +836,7 @@ const ProgrammeTab = {
       try {
         const res = await apiPost("/objectives/finalize", {
           module: draft.module, chapters: draft.chapters, days: draft.chosenDays,
-          start_time: draft.chosenTime, duration_minutes: draft.duration_minutes
+          start_time: draft.chosenTime, duration_minutes: draft.duration_minutes, start_date: draft.start_date
         });
         applyCreatedObjective(res.module, res.chapters);
         chatLog.value.push({
@@ -856,7 +869,7 @@ const ProgrammeTab = {
 
     return {
       chapters, loading, modules, selectedModule, columns, moduleProgress, overallProgress,
-      newChapter, saveChapterText, moveChapterModule, addChapter, removeChapter, columnEls,
+      newChapter, saveChapterText, rescheduleChapter, moveChapterModule, addChapter, removeChapter, columnEls,
       CHAPTER_STYLE, generatingQuizFor, quizGenError, quizGenDone, generateQuizForChapter,
       showManualAdd, objectiveMessage, objectiveLoading, objectiveError, generateObjective,
       pendingTime, confirmPendingTime, chatLog, objectivesPanel, moduleStyle, removeObjective,
@@ -917,7 +930,9 @@ const ProgrammeTab = {
                         </div>
                       </div>
                       <div class="kanban-card-meta">
-                        <input type="text" class="kanban-card-input" v-model="c.month_label" @change="saveChapterText(c)" placeholder="Période">
+                        <input type="date" class="kanban-card-input" v-model="c.scheduled_date" @change="rescheduleChapter(c)" title="Date de la session">
+                        <input type="time" class="kanban-card-input" v-model="c.scheduled_time" @change="rescheduleChapter(c)"
+                          :disabled="!c.scheduled_date" title="Heure de la session">
                         <select class="kanban-card-select" :value="c.module" @change="moveChapterModule(c, $event.target.value)">
                           <option v-for="m in modules" :key="m" :value="m">{{ m }}</option>
                         </select>
@@ -965,10 +980,13 @@ const ProgrammeTab = {
           <div class="chat-log">
             <div class="chat-bubble chat-bubble-assistant">
               Décris un objectif — comptabilité, anglais, un projet à développer, un concours administratif,
-              n'importe quel domaine. Précise tes disponibilités si tu en as (jours, heure, durée) ; sinon
-              je choisis moi-même une durée raisonnable, et je ne te demande les jours et/ou l'heure que si
-              je n'ai vraiment aucun indice. Tu peux aussi me donner un programme, référentiel ou cours précis
-              à suivre (ex. « le programme du DCG UE9 », « le plan du livre X ») — je structure les chapitres dessus.
+              n'importe quel domaine. Précise tes disponibilités si tu en as (jours, heure, durée, date de
+              début) ; sinon je choisis moi-même une durée raisonnable, et je ne te demande les jours et/ou
+              l'heure que si je n'ai vraiment aucun indice. Si tu veux démarrer à une date précise (ex.
+              « à partir du 20 octobre »), dis-le explicitement — je ne peux pas deviner tout seul une
+              date liée à un autre programme en cours, seulement une date que tu me donnes clairement. Tu
+              peux aussi me donner un programme, référentiel ou cours précis à suivre (ex. « le programme
+              du DCG UE9 », « le plan du livre X ») — je structure les chapitres dessus.
             </div>
             <template v-for="(m,i) in chatLog" :key="i">
               <div class="chat-bubble chat-bubble-user">{{ m.title }}</div>
